@@ -40,6 +40,10 @@ panel_messages: Dict[int, int] = {}
 # Global message tracker: maps tg_id -> message_id for lobby status messages
 lobby_messages: Dict[int, int] = {}
 
+# Active panels state tracker: maps tg_id -> dict of panel state
+# Dict contains: {"room_id": str, "state": "main"|"buy"|"rent_target"|"rent_amount"|"chance_action"|"chance_amount"|"bankrupt", "amount": str, "target_id": int, "chance_type": "gain"|"lose"}
+active_panels: Dict[int, dict] = {}
+
 
 # FSM States
 class RoomCreation(StatesGroup):
@@ -47,13 +51,6 @@ class RoomCreation(StatesGroup):
     waiting_for_custom_players = State()
     waiting_for_balance = State()
     waiting_for_custom_balance = State()
-
-
-class GamePlay(StatesGroup):
-    waiting_for_buy_amount = State()
-    waiting_for_rent_target = State()
-    waiting_for_rent_amount = State()
-    waiting_for_chance_amount = State()
 
 
 # Keyboards
@@ -120,6 +117,90 @@ def get_game_panel_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
+def get_keypad_keyboard(state: str, room_id: str, amount: str = "0") -> InlineKeyboardMarkup:
+    display_text = f"💰 ${amount}" if amount != "0" else "💰 $0"
+    buttons = [
+        # Display row — shows the current amount
+        [
+            InlineKeyboardButton(text=display_text, callback_data="kp_noop")
+        ],
+        [
+            InlineKeyboardButton(text="1", callback_data="kp_1"),
+            InlineKeyboardButton(text="2", callback_data="kp_2"),
+            InlineKeyboardButton(text="3", callback_data="kp_3")
+        ],
+        [
+            InlineKeyboardButton(text="4", callback_data="kp_4"),
+            InlineKeyboardButton(text="5", callback_data="kp_5"),
+            InlineKeyboardButton(text="6", callback_data="kp_6")
+        ],
+        [
+            InlineKeyboardButton(text="7", callback_data="kp_7"),
+            InlineKeyboardButton(text="8", callback_data="kp_8"),
+            InlineKeyboardButton(text="9", callback_data="kp_9")
+        ],
+        [
+            InlineKeyboardButton(text="C", callback_data="kp_clear"),
+            InlineKeyboardButton(text="0", callback_data="kp_0"),
+            InlineKeyboardButton(text="⌫", callback_data="kp_backspace")
+        ],
+        [
+            InlineKeyboardButton(text="❌ Скасувати", callback_data="kp_cancel"),
+            InlineKeyboardButton(text="✔ Підтвердити", callback_data="kp_confirm")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_rent_targets_keyboard(room_id: str, sender_tg_id: int) -> InlineKeyboardMarkup:
+    other_players = [p for p in engine.get_players_in_room(room_id) if p.tg_id != sender_tg_id and not p.is_bankrupt]
+    buttons = []
+    for op in other_players:
+        buttons.append([InlineKeyboardButton(text=f"👤 @{op.username}", callback_data=f"rent_sel_{op.tg_id}")])
+    buttons.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="kp_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_chance_action_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(text="➕ Отримати $", callback_data="chance_sel_gain"),
+            InlineKeyboardButton(text="➖ Втратити $", callback_data="chance_sel_lose")
+        ],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="kp_cancel")]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_bankrupt_confirm_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(text="💀 Так, я банкрут", callback_data="bankrupt_confirm"),
+            InlineKeyboardButton(text="❌ Ні, скасувати", callback_data="kp_cancel")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def get_panel_keyboard_for_player(player_tg_id: int) -> InlineKeyboardMarkup:
+    state_data = active_panels.get(player_tg_id, {"state": "main"})
+    state = state_data.get("state", "main")
+    room_id = state_data.get("room_id")
+    amount = state_data.get("amount", "0")
+    
+    if state == "main":
+        return get_game_panel_keyboard()
+    elif state in ("buy", "rent_amount", "chance_amount"):
+        return get_keypad_keyboard(state, room_id, amount)
+    elif state == "rent_target":
+        return get_rent_targets_keyboard(room_id, player_tg_id)
+    elif state == "chance_action":
+        return get_chance_action_keyboard()
+    elif state == "bankrupt":
+        return get_bankrupt_confirm_keyboard()
+    return get_game_panel_keyboard()
+
+
 # Helper Functions
 def generate_room_code() -> str:
     # 6-character user-friendly code
@@ -159,7 +240,7 @@ def format_lobby(room_id: str) -> str:
     return text
 
 
-def format_game_status(room_id: str) -> str:
+def format_game_status(room_id: str, player_tg_id: int = None) -> str:
     room = engine.rooms.get(room_id)
     if not room:
         return "❌ Кімнату не знайдено."
@@ -182,9 +263,9 @@ def format_game_status(room_id: str) -> str:
         text += f"{idx}. {status_icon} <b>@{player.username}</b>: ${player.balance}{status_suffix}\n"
         
     text += f"━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"📜 <b>Останні 3 транзакції:</b>\n"
+    text += f"📜 <b>Останні 10 транзакцій:</b>\n"
     
-    last_txs = engine.get_last_transactions(room_id, limit=3)
+    last_txs = engine.get_last_transactions(room_id, limit=10)
     if not last_txs:
         text += "<i>Транзакцій ще не було</i>\n"
     else:
@@ -217,6 +298,37 @@ def format_game_status(room_id: str) -> str:
             text += f"• {from_str} ➡️ {to_str}: <b>${tx.amount}</b> ({tx_type_str})\n"
             
     text += f"━━━━━━━━━━━━━━━━━━━━\n"
+
+    # If there is a player_tg_id and they have an active panel state, show it
+    if player_tg_id and player_tg_id in active_panels:
+        state_data = active_panels[player_tg_id]
+        state = state_data.get("state", "main")
+        amount = state_data.get("amount", "0")
+        
+        if state == "buy":
+            text += f"🛍️ <b>Купівля у Банку:</b>\n💰 Введена сума: <b>${amount}</b>\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━\n"
+        elif state == "rent_target":
+            text += f"🏡 <b>Сплата ренти:</b>\n👤 Оберіть отримувача:\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━\n"
+        elif state == "rent_amount":
+            target_id = state_data.get("target_id")
+            target_player = engine.players.get(target_id)
+            target_username = target_player.username if target_player else "Невідомий"
+            text += f"🏡 <b>Сплата ренти для @{target_username}:</b>\n💰 Введена сума: <b>${amount}</b>\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━\n"
+        elif state == "chance_action":
+            text += f"❓ <b>Картка Шанс:</b>\nОберіть тип операції з Банком:\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━\n"
+        elif state == "chance_amount":
+            chance_type = state_data.get("chance_type")
+            action_text = "отримати від Банку" if chance_type == "gain" else "сплатити Банку"
+            text += f"❓ <b>Картка Шанс ({action_text}):</b>\n💰 Введена сума: <b>${amount}</b>\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━\n"
+        elif state == "bankrupt":
+            text += f"⚠️ <b>Оголошення банкрутства:</b>\nВи впевнені, що хочете оголосити банкрутство? Ваш рахунок буде анульовано!\n"
+            text += f"━━━━━━━━━━━━━━━━━━━━\n"
+
     text += f"🕒 Оновлено: <code>{datetime.now().strftime('%H:%M:%S')}</code>"
     return text
 
@@ -248,12 +360,21 @@ async def update_lobby_messages(room_id: str, bot: Bot):
 
 async def update_room_panels(room_id: str, bot: Bot):
     players = engine.get_players_in_room(room_id)
-    status_text = format_game_status(room_id)
-    panel_kb = get_game_panel_keyboard()
     
     for p in players:
+        if p.tg_id not in active_panels:
+            active_panels[p.tg_id] = {
+                "room_id": room_id,
+                "state": "main",
+                "amount": "0",
+                "target_id": None,
+                "chance_type": None
+            }
+            
         msg_id = panel_messages.get(p.tg_id)
         if msg_id:
+            status_text = format_game_status(room_id, p.tg_id)
+            panel_kb = get_panel_keyboard_for_player(p.tg_id)
             try:
                 await bot.edit_message_text(
                     chat_id=p.tg_id,
@@ -280,6 +401,26 @@ async def update_room_panels(room_id: str, bot: Bot):
                             pass
                     except Exception as send_err:
                         logger.error(f"Failed to send new panel to {p.tg_id}: {send_err}")
+
+
+async def update_player_panel(tg_id: int, bot: Bot):
+    state_data = active_panels.get(tg_id)
+    if not state_data:
+        return
+    room_id = state_data.get("room_id")
+    msg_id = panel_messages.get(tg_id)
+    if msg_id:
+        status_text = format_game_status(room_id, tg_id)
+        panel_kb = get_panel_keyboard_for_player(tg_id)
+        try:
+            await bot.edit_message_text(
+                chat_id=tg_id,
+                message_id=msg_id,
+                text=status_text,
+                reply_markup=panel_kb
+            )
+        except Exception as e:
+            logger.error(f"Failed to edit panel for player {tg_id}: {e}")
 
 
 async def broadcast_to_room(room_id: str, bot: Bot, text: str):
@@ -514,10 +655,17 @@ async def process_lobby_start(callback: CallbackQuery):
                     pass
                     
         # Send new Global Status Panel to everyone and pin it
-        status_text = format_game_status(room_id)
-        panel_kb = get_game_panel_keyboard()
-        
         for p in players:
+            active_panels[p.tg_id] = {
+                "room_id": room_id,
+                "state": "main",
+                "amount": "0",
+                "target_id": None,
+                "chance_type": None
+            }
+            status_text = format_game_status(room_id, p.tg_id)
+            panel_kb = get_panel_keyboard_for_player(p.tg_id)
+            
             msg = await callback.bot.send_message(
                 chat_id=p.tg_id,
                 text=status_text,
@@ -549,16 +697,12 @@ async def process_lobby_refresh(callback: CallbackQuery):
 
 # Gameplay Actions (Buy, Rent, Chance, Bankrupt)
 @router.callback_query(F.data == "btn_buy_bank")
-async def process_btn_buy(callback: CallbackQuery, state: FSMContext):
+async def process_btn_buy(callback: CallbackQuery):
     tg_id = callback.from_user.id
     player = engine.players.get(tg_id)
     
-    if not player:
-        await callback.answer("❌ Ви не берете участі у грі.", show_alert=True)
-        return
-        
-    if player.is_bankrupt:
-        await callback.answer("❌ Збанкрутілі гравці не можуть здійснювати операції.", show_alert=True)
+    if not player or player.is_bankrupt:
+        await callback.answer("❌ Ви не берете участі у грі або збанкрутіли.", show_alert=True)
         return
         
     room = engine.rooms.get(player.room_id)
@@ -567,64 +711,23 @@ async def process_btn_buy(callback: CallbackQuery, state: FSMContext):
         return
         
     await callback.answer()
-    await state.set_state(GamePlay.waiting_for_buy_amount)
-    await state.update_data(room_id=player.room_id)
-    
-    await callback.message.answer(
-        "🛍️ <b>Купівля у Банку:</b>\n"
-        "Введіть суму покупки (ціле число):",
-        reply_markup=get_cancel_keyboard()
-    )
-
-
-@router.message(GamePlay.waiting_for_buy_amount)
-async def process_buy_amount(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not text.isdigit() or int(text) <= 0:
-        await message.answer("❌ Будь ласка, введіть додатне ціле число:")
-        return
-        
-    amount = int(text)
-    data = await state.get_data()
-    room_id = data.get("room_id")
-    tg_id = message.from_user.id
-    username = get_user_display_name(message)
-    
-    try:
-        engine.execute_transaction(
-            room_id=room_id,
-            from_id=tg_id,
-            to_id="BANK",
-            amount=amount,
-            tx_type=TransactionType.PURCHASE
-        )
-        
-        await message.answer(
-            f"✅ Успішно! Ви сплатили Банку ${amount}.",
-            reply_markup=get_main_keyboard()
-        )
-        await state.clear()
-        
-        # Broadcast and update UI
-        await broadcast_to_room(room_id, message.bot, f"💸 @{username} сплатив Банку <b>${amount}</b> за покупку.")
-        await update_room_panels(room_id, message.bot)
-        
-    except ValueError as e:
-        await message.answer(f"❌ Insufficient funds! ({str(e)})", reply_markup=get_main_keyboard())
-        await state.clear()
+    active_panels[tg_id] = {
+        "room_id": player.room_id,
+        "state": "buy",
+        "amount": "0",
+        "target_id": None,
+        "chance_type": None
+    }
+    await update_player_panel(tg_id, callback.bot)
 
 
 @router.callback_query(F.data == "btn_pay_rent")
-async def process_btn_rent(callback: CallbackQuery, state: FSMContext):
+async def process_btn_rent(callback: CallbackQuery):
     tg_id = callback.from_user.id
     player = engine.players.get(tg_id)
     
-    if not player:
-        await callback.answer("❌ Ви не берете участі у грі.", show_alert=True)
-        return
-        
-    if player.is_bankrupt:
-        await callback.answer("❌ Збанкрутілі гравці не можуть здійснювати операції.", show_alert=True)
+    if not player or player.is_bankrupt:
+        await callback.answer("❌ Ви не берете участі у грі або збанкрутіли.", show_alert=True)
         return
         
     room = engine.rooms.get(player.room_id)
@@ -632,117 +735,29 @@ async def process_btn_rent(callback: CallbackQuery, state: FSMContext):
         await callback.answer("❌ Гра не активна.", show_alert=True)
         return
         
-    # Get other active players in room
     other_players = [p for p in engine.get_players_in_room(player.room_id) if p.tg_id != tg_id and not p.is_bankrupt]
-    
     if not other_players:
         await callback.answer("❌ Немає інших активних гравців для сплати оренди.", show_alert=True)
         return
         
     await callback.answer()
-    
-    # Create selection keyboard
-    buttons = []
-    for op in other_players:
-        buttons.append([InlineKeyboardButton(text=f"👤 @{op.username}", callback_data=f"rent_target_{op.tg_id}")])
-    buttons.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="rent_cancel")])
-    
-    await state.set_state(GamePlay.waiting_for_rent_target)
-    await state.update_data(room_id=player.room_id)
-    await callback.message.answer(
-        "🏡 <b>Сплата ренти:</b>\n"
-        "Оберіть гравця, якому хочете сплатити:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+    active_panels[tg_id] = {
+        "room_id": player.room_id,
+        "state": "rent_target",
+        "amount": "0",
+        "target_id": None,
+        "chance_type": None
+    }
+    await update_player_panel(tg_id, callback.bot)
 
 
-@router.callback_query(GamePlay.waiting_for_rent_target, F.data == "rent_cancel")
-async def process_rent_cancel(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.clear()
-    await callback.message.edit_text("❌ Операцію скасовано.")
-
-
-@router.callback_query(GamePlay.waiting_for_rent_target, F.data.startswith("rent_target_"))
-async def process_rent_target(callback: CallbackQuery, state: FSMContext):
-    target_id = int(callback.data.split("_")[2])
-    target_player = engine.players.get(target_id)
-    
-    if not target_player:
-        await callback.answer("❌ Гравця не знайдено.", show_alert=True)
-        await state.clear()
-        return
-        
-    await callback.answer()
-    await state.update_data(rent_target_id=target_id)
-    await state.set_state(GamePlay.waiting_for_rent_amount)
-    
-    await callback.message.edit_text(
-        f"🏡 <b>Сплата ренти для @{target_player.username}:</b>\n"
-        f"Введіть суму оренди (ціле число):",
-        reply_markup=None
-    )
-    # We send a message with cancel keyboard so they have the button
-    await callback.bot.send_message(
-        chat_id=callback.from_user.id,
-        text="Ви можете скасувати операцію, натиснувши на кнопку нижче або відправивши /cancel.",
-        reply_markup=get_cancel_keyboard()
-    )
-
-
-@router.message(GamePlay.waiting_for_rent_amount)
-async def process_rent_amount(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not text.isdigit() or int(text) <= 0:
-        await message.answer("❌ Будь ласка, введіть додатне ціле число:")
-        return
-        
-    amount = int(text)
-    data = await state.get_data()
-    room_id = data.get("room_id")
-    target_id = data.get("rent_target_id")
-    tg_id = message.from_user.id
-    
-    sender_username = get_user_display_name(message)
-    target_player = engine.players.get(target_id)
-    target_username = target_player.username if target_player else "Невідомий"
-    
-    try:
-        engine.execute_transaction(
-            room_id=room_id,
-            from_id=tg_id,
-            to_id=target_id,
-            amount=amount,
-            tx_type=TransactionType.RENT
-        )
-        
-        await message.answer(
-            f"✅ Успішно! Ви перевели ${amount} для @{target_username}.",
-            reply_markup=get_main_keyboard()
-        )
-        await state.clear()
-        
-        # Broadcast and update UI
-        await broadcast_to_room(room_id, message.bot, f"💸 @{sender_username} сплатив оренду @{target_username} на суму <b>${amount}</b>.")
-        await update_room_panels(room_id, message.bot)
-        
-    except ValueError as e:
-        await message.answer(f"❌ Insufficient funds! ({str(e)})", reply_markup=get_main_keyboard())
-        await state.clear()
-
-
-# Chance Handler
 @router.callback_query(F.data == "btn_chance")
-async def process_btn_chance(callback: CallbackQuery, state: FSMContext):
+async def process_btn_chance(callback: CallbackQuery):
     tg_id = callback.from_user.id
     player = engine.players.get(tg_id)
     
-    if not player:
-        await callback.answer("❌ Ви не берете участі у грі.", show_alert=True)
-        return
-        
-    if player.is_bankrupt:
-        await callback.answer("❌ Збанкрутілі гравці не можуть здійснювати операції.", show_alert=True)
+    if not player or player.is_bankrupt:
+        await callback.answer("❌ Ви не берете участі у грі або збанкрутіли.", show_alert=True)
         return
         
     room = engine.rooms.get(player.room_id)
@@ -751,115 +766,23 @@ async def process_btn_chance(callback: CallbackQuery, state: FSMContext):
         return
         
     await callback.answer()
-    
-    buttons = [
-        [
-            InlineKeyboardButton(text="➕ Отримати гроші", callback_data="chance_action_gain"),
-            InlineKeyboardButton(text="➖ Втратити гроші", callback_data="chance_action_lose")
-        ],
-        [InlineKeyboardButton(text="❌ Скасувати", callback_data="chance_cancel")]
-    ]
-    
-    await state.update_data(room_id=player.room_id)
-    await callback.message.answer(
-        "❓ <b>Картка Шанс:</b>\n"
-        "Оберіть тип операції з Банком:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
+    active_panels[tg_id] = {
+        "room_id": player.room_id,
+        "state": "chance_action",
+        "amount": "0",
+        "target_id": None,
+        "chance_type": None
+    }
+    await update_player_panel(tg_id, callback.bot)
 
 
-@router.callback_query(F.data == "chance_cancel")
-async def process_chance_cancel(callback: CallbackQuery, state: FSMContext):
-    await callback.answer()
-    await state.clear()
-    await callback.message.edit_text("❌ Операцію скасовано.")
-
-
-@router.callback_query(F.data.startswith("chance_action_"))
-async def process_chance_action(callback: CallbackQuery, state: FSMContext):
-    action = callback.data.split("_")[2]  # gain or lose
-    await callback.answer()
-    
-    await state.update_data(chance_type=action)
-    await state.set_state(GamePlay.waiting_for_chance_amount)
-    
-    action_text = "отримати від Банку" if action == "gain" else "сплатити Банку"
-    
-    await callback.message.edit_text(
-        f"❓ <b>Картка Шанс ({action_text}):</b>\n"
-        f"Введіть суму (ціле число):",
-        reply_markup=None
-    )
-    
-    await callback.bot.send_message(
-        chat_id=callback.from_user.id,
-        text="Ви можете скасувати операцію, натиснувши на кнопку нижче або відправивши /cancel.",
-        reply_markup=get_cancel_keyboard()
-    )
-
-
-@router.message(GamePlay.waiting_for_chance_amount)
-async def process_chance_amount(message: Message, state: FSMContext):
-    text = message.text.strip()
-    if not text.isdigit() or int(text) <= 0:
-        await message.answer("❌ Будь ласка, введіть додатне ціле число:")
-        return
-        
-    amount = int(text)
-    data = await state.get_data()
-    room_id = data.get("room_id")
-    chance_type = data.get("chance_type")
-    tg_id = message.from_user.id
-    username = get_user_display_name(message)
-    
-    try:
-        if chance_type == "gain":
-            engine.execute_transaction(
-                room_id=room_id,
-                from_id="BANK",
-                to_id=tg_id,
-                amount=amount,
-                tx_type=TransactionType.CHANCE_WIN
-            )
-            await message.answer(
-                f"✅ Успішно! Ви отримали від Банку ${amount}.",
-                reply_markup=get_main_keyboard()
-            )
-            await broadcast_to_room(room_id, message.bot, f"🎁 @{username} отримав від Банку <b>${amount}</b> за карткою Шанс.")
-        else:
-            engine.execute_transaction(
-                room_id=room_id,
-                from_id=tg_id,
-                to_id="BANK",
-                amount=amount,
-                tx_type=TransactionType.CHANCE_LOSS
-            )
-            await message.answer(
-                f"✅ Успішно! Ви сплатили Банку ${amount}.",
-                reply_markup=get_main_keyboard()
-            )
-            await broadcast_to_room(room_id, message.bot, f"💸 @{username} сплатив Банку <b>${amount}</b> за карткою Шанс.")
-            
-        await state.clear()
-        await update_room_panels(room_id, message.bot)
-        
-    except ValueError as e:
-        await message.answer(f"❌ Insufficient funds! ({str(e)})", reply_markup=get_main_keyboard())
-        await state.clear()
-
-
-# Bankruptcy Handler
 @router.callback_query(F.data == "btn_bankrupt")
 async def process_btn_bankrupt(callback: CallbackQuery):
     tg_id = callback.from_user.id
     player = engine.players.get(tg_id)
     
-    if not player:
-        await callback.answer("❌ Ви не берете участі у грі.", show_alert=True)
-        return
-        
-    if player.is_bankrupt:
-        await callback.answer("❌ Ви вже є банкрутом.", show_alert=True)
+    if not player or player.is_bankrupt:
+        await callback.answer("❌ Ви не берете участі у грі або вже є банкрутом.", show_alert=True)
         return
         
     room = engine.rooms.get(player.room_id)
@@ -868,24 +791,169 @@ async def process_btn_bankrupt(callback: CallbackQuery):
         return
         
     await callback.answer()
+    active_panels[tg_id] = {
+        "room_id": player.room_id,
+        "state": "bankrupt",
+        "amount": "0",
+        "target_id": None,
+        "chance_type": None
+    }
+    await update_player_panel(tg_id, callback.bot)
+
+
+@router.callback_query(F.data.startswith("rent_sel_"))
+async def process_rent_sel(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    target_id = int(callback.data.split("_")[2])
     
-    buttons = [
-        [
-            InlineKeyboardButton(text="💀 Так, я банкрут", callback_data="bankrupt_confirm"),
-            InlineKeyboardButton(text="❌ Ні, скасувати", callback_data="bankrupt_cancel")
-        ]
-    ]
-    await callback.message.answer(
-        "⚠️ <b>Оголошення банкрутства:</b>\n"
-        "Ви впевнені, що хочете оголосити банкрутство? Ваш рахунок буде анульовано, і ви більше не зможете брати участь у транзакціях.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
-    )
-
-
-@router.callback_query(F.data == "bankrupt_cancel")
-async def process_bankrupt_cancel(callback: CallbackQuery):
+    state_data = active_panels.get(tg_id)
+    if not state_data or state_data.get("state") != "rent_target":
+        await callback.answer("❌ Сталася помилка. Спробуйте ще раз.", show_alert=True)
+        return
+        
     await callback.answer()
-    await callback.message.edit_text("❌ Операцію скасовано.")
+    state_data["state"] = "rent_amount"
+    state_data["target_id"] = target_id
+    state_data["amount"] = "0"
+    await update_player_panel(tg_id, callback.bot)
+
+
+@router.callback_query(F.data.startswith("chance_sel_"))
+async def process_chance_sel(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    action = callback.data.split("_")[2]
+    
+    state_data = active_panels.get(tg_id)
+    if not state_data or state_data.get("state") != "chance_action":
+        await callback.answer("❌ Сталася помилка. Спробуйте ще раз.", show_alert=True)
+        return
+        
+    await callback.answer()
+    state_data["state"] = "chance_amount"
+    state_data["chance_type"] = action
+    state_data["amount"] = "0"
+    await update_player_panel(tg_id, callback.bot)
+
+
+@router.callback_query(F.data == "kp_noop")
+async def process_keypad_noop(callback: CallbackQuery):
+    # Display button tapped — just acknowledge silently
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("kp_"))
+async def process_keypad(callback: CallbackQuery):
+    tg_id = callback.from_user.id
+    action = callback.data.split("_")[1]
+    
+    state_data = active_panels.get(tg_id)
+    if not state_data:
+        await callback.answer("❌ Панель не знайдено.", show_alert=True)
+        return
+        
+    room_id = state_data.get("room_id")
+    state = state_data.get("state")
+    current_amount = state_data.get("amount", "0")
+    
+    if action == "cancel":
+        await callback.answer("❌ Операцію скасовано.")
+        active_panels[tg_id] = {
+            "room_id": room_id,
+            "state": "main",
+            "amount": "0",
+            "target_id": None,
+            "chance_type": None
+        }
+        await update_player_panel(tg_id, callback.bot)
+        return
+        
+    if action == "clear":
+        await callback.answer()
+        state_data["amount"] = "0"
+        await update_player_panel(tg_id, callback.bot)
+        return
+        
+    if action == "backspace":
+        await callback.answer()
+        if len(current_amount) <= 1:
+            state_data["amount"] = "0"
+        else:
+            state_data["amount"] = current_amount[:-1]
+        await update_player_panel(tg_id, callback.bot)
+        return
+        
+    if action == "confirm":
+        amount = int(current_amount)
+        if amount <= 0:
+            await callback.answer("❌ Сума транзакції повинна бути більшою за 0.", show_alert=True)
+            return
+            
+        try:
+            if state == "buy":
+                engine.execute_transaction(
+                    room_id=room_id,
+                    from_id=tg_id,
+                    to_id="BANK",
+                    amount=amount,
+                    tx_type=TransactionType.PURCHASE
+                )
+                await callback.answer("✅ Купівлю успішно здійснено!")
+            elif state == "rent_amount":
+                target_id = state_data.get("target_id")
+                engine.execute_transaction(
+                    room_id=room_id,
+                    from_id=tg_id,
+                    to_id=target_id,
+                    amount=amount,
+                    tx_type=TransactionType.RENT
+                )
+                await callback.answer("✅ Ренту успішно сплачено!")
+            elif state == "chance_amount":
+                chance_type = state_data.get("chance_type")
+                if chance_type == "gain":
+                    engine.execute_transaction(
+                        room_id=room_id,
+                        from_id="BANK",
+                        to_id=tg_id,
+                        amount=amount,
+                        tx_type=TransactionType.CHANCE_WIN
+                    )
+                    await callback.answer("✅ Кошти від Банку отримано!")
+                else:
+                    engine.execute_transaction(
+                        room_id=room_id,
+                        from_id=tg_id,
+                        to_id="BANK",
+                        amount=amount,
+                        tx_type=TransactionType.CHANCE_LOSS
+                    )
+                    await callback.answer("✅ Штраф Банку сплачено!")
+            
+            # Reset panel state
+            active_panels[tg_id] = {
+                "room_id": room_id,
+                "state": "main",
+                "amount": "0",
+                "target_id": None,
+                "chance_type": None
+            }
+            # Update panel for everyone in room
+            await update_room_panels(room_id, callback.bot)
+            
+        except ValueError as e:
+            await callback.answer(f"❌ Помилка: {str(e)}", show_alert=True)
+        return
+        
+    # Standard digit input
+    await callback.answer()
+    if current_amount == "0":
+        if action != "0":
+            state_data["amount"] = action
+    else:
+        if len(current_amount) < 6:
+            state_data["amount"] = current_amount + action
+            
+    await update_player_panel(tg_id, callback.bot)
 
 
 @router.callback_query(F.data == "bankrupt_confirm")
@@ -898,10 +966,18 @@ async def process_bankrupt_confirm(callback: CallbackQuery):
         return
         
     room_id = player.room_id
-    await callback.answer()
-    await callback.message.edit_text("💀 Ви оголосили себе банкрутом.")
+    await callback.answer("💀 Ви оголосили себе банкрутом.")
     
     engine.bankrupt_player(room_id, tg_id)
+    
+    # Reset panel state
+    active_panels[tg_id] = {
+        "room_id": room_id,
+        "state": "main",
+        "amount": "0",
+        "target_id": None,
+        "chance_type": None
+    }
     
     # Broadcast to room
     await broadcast_to_room(room_id, callback.bot, f"💀 Гравець @{player.username} оголосив себе банкрутом!")

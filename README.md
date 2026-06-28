@@ -3,8 +3,12 @@
 Telegram bot acting as a **Digital Banker** for physical Monopoly board games. The bot handles virtual rooms, player balances, and all transactions transparently. Localized in Ukrainian.
 
 Built with Python, using the **`aiogram` v3** framework and following **Specification-Driven Development (SDD)** guidelines.
+___
 
----
+## Screenshots
+
+![Screenshot_1](./assets/screenshot_1.png)
+![Screenshot_2](./assets/screenshot_2.png)
 
 ## 🛠️ Architecture & Features
 

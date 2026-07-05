@@ -3,7 +3,7 @@ name: Deploy to GitHub Pages
 on:
   # Runs on pushes targeting the default branch and website folder
   push:
-    branches: ["main"]
+    branches: ["master"]
     paths:
       - "website/**"
       - ".github/workflows/website.yml"

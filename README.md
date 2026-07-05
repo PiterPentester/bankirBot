@@ -1,5 +1,7 @@
 # Monopoly Digital Banker Bot
 
+![Logo](./assets/logo_bankir_bot.png)
+
 Telegram bot acting as a **Digital Banker** for physical Monopoly board games. The bot handles virtual rooms, player balances, and all transactions transparently. Localized in Ukrainian.
 
 Built with Python, using the **`aiogram` v3** framework and following **Specification-Driven Development (SDD)** guidelines.
